@@ -1,0 +1,6 @@
+sdk: ^2.0.0-alpha.199
+prefixes:
+  tca9548a: toit-tca9548a
+packages:
+  toit-tca9548a:
+    path: ..

@@ -1,0 +1,23 @@
+name: Publish package
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions: {}
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yaml
+
+  create-release:
+    name: Create new release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      # TODO: enable once the package is ready to release.
+      # - name: Publish
+      #   uses: toitlang/pkg-publish@v1.5.0
+      - run: echo "Publishing disabled."

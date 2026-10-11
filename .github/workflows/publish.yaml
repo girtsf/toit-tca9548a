@@ -17,7 +17,5 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      # TODO: enable once the package is ready to release.
-      # - name: Publish
-      #   uses: toitlang/pkg-publish@v1.5.0
-      - run: echo "Publishing disabled."
+      - name: Publish
+        uses: toitlang/action-publish@v1.5.0

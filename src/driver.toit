@@ -151,10 +151,13 @@ class Driver:
         mux_.write #[0]
         mask_ = 0
       finally:
-        shared_.do --values: it.device.close
-        shared_.clear
-        open-keys_.clear
-        mux_.close
+        // Device closes wait for the bus, which throws when cancelled or
+        // past a deadline, and would leak the devices not closed yet.
+        critical-do --no-respect-deadline:
+          shared_.do --values: it.device.close
+          shared_.clear
+          open-keys_.clear
+          mux_.close
 
   /**
   Runs the $block with only the $channel enabled.

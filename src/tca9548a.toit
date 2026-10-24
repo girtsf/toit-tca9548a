@@ -27,6 +27,13 @@ Every transaction on a $ChannelDevice first enables its channel and disables
 Chips at the same address share one $i2c.Device, as Toit doesn't allow more
   than one device with the same address on the same bus.
 
+A multiplexer behind a channel of another one is opened with
+  $Driver.nested. Its transactions first select that channel on the parent.
+
+$Driver.with-channel runs a block with a channel selected and the lock held,
+  for chips whose driver doesn't take a $serial.Device, or for transactions
+  that must not be interleaved with other tasks.
+
 For manual control (for example to scan a channel with $i2c.Bus.scan), use
   $Driver.select, $Driver.enabled-mask, $Driver.disable-all, and
   $Driver.reset.
@@ -38,7 +45,13 @@ Chips on the upstream bus, including the multiplexer itself, answer on every
 
 When several multiplexers share an upstream bus, their enabled channels are
   connected in parallel. The driver does not coordinate between multiplexers;
-  at most one of them should have channels enabled at a time.
+  at most one of them should have channels enabled at a time. Nested
+  multiplexers (see $Driver.nested) are the exception: the parent's
+  channel isolates them.
+
+A nested multiplexer keeps its channels enabled while the parent talks to
+  other devices on the same channel. Their addresses must not clash with the
+  chips behind the enabled nested channels.
 
 The cached control register is only valid if no one else writes it. After an
   external change (another program, or a brown-out of the chip), call

@@ -71,6 +71,10 @@ main:
   test-registers
   test-close
   test-invalid
+  test-with-channel
+  test-nested
+  test-nested-close
+  print "ok"
 
 test-select:
   f := Fixture
@@ -174,4 +178,95 @@ test-invalid:
   expect-throw "INVALID_ARGUMENT": f.driver.enabled-mask = 0x100
   expect-throw "INVALID_ARGUMENT": f.driver.device --channel=8 0x40
   expect-throw "NO_RESET_PIN": f.driver.reset
+  expect-equals [] f.take-log
+
+test-with-channel:
+  f := Fixture
+  result := f.driver.with-channel 6:
+    f.log.add "block"
+    42
+  expect-equals 42 result
+  expect-equals ["70 write #[0x40]", "block"] f.take-log
+  expect-throw "INVALID_ARGUMENT": f.driver.with-channel 8: null
+
+  inner := f.driver.nested --channel=2 0x71
+  inner.with-channel 3: f.log.add "block"
+  expect-equals ["70 write #[0x04]", "71 write #[0x08]", "block"] f.take-log
+
+test-nested:
+  f := Fixture
+  inner := f.driver.nested --channel=2 0x71
+  expect-equals 1 f.opened.size
+  expect-throw "Device already connected": f.driver.device --channel=2 0x71
+  expect-throw "Device already connected":
+    f.driver.nested --channel=2 0x71
+  // Upstream devices are shared with the parent.
+  a := inner.device --channel=3 0x44
+  b := f.driver.device --channel=0 0x44
+  expect-equals 2 f.opened.size
+
+  a.read 2
+  a.read 2
+  b.read 2
+  a.read 2
+  inner.select 1
+  expect-equals [
+    "70 write #[0x04]",
+    "71 write #[0x08]",
+    "44 read 2",
+    "44 read 2",
+    "70 write #[0x01]",
+    "44 read 2",
+    "70 write #[0x04]",
+    "44 read 2",
+    "71 write #[0x02]",
+  ] f.take-log
+
+  // Doubly nested.
+  inner2 := inner.nested --channel=1 0x72
+  c := inner2.device --channel=7 0x45
+  inner.select 7
+  f.driver.select 7
+  f.take-log
+  c.read 1
+  expect-equals [
+    "70 write #[0x04]",
+    "71 write #[0x02]",
+    "72 write #[0x80]",
+    "45 read 1",
+  ] f.take-log
+
+test-nested-close:
+  f := Fixture
+  inner := f.driver.nested --channel=2 0x71
+  a := inner.device --channel=3 0x44
+  b := f.driver.device --channel=0 0x44
+  b.read 1
+  f.take-log
+  inner.close
+  expect-equals [
+    "70 write #[0x04]",
+    "71 write #[0x00]",
+    "71 close",
+  ] f.take-log
+  expect-throw "CLOSED": a.read 1
+  expect-throw "CLOSED": inner.select 0
+  // Still used by the parent.
+  expect-not f.opened[0x44].is-closed
+  b.close
+  expect f.opened[0x44].is-closed
+  // The address can be reopened on the parent.
+  f.opened.clear
+  f.driver.device --channel=2 0x71
+
+  // Closing the parent closes the nested driver.
+  f = Fixture
+  inner = f.driver.nested --channel=2 0x71
+  a = inner.device --channel=3 0x44
+  f.driver.close
+  f.take-log
+  expect-throw "CLOSED": a.read 1
+  expect-throw "CLOSED": inner.select 0
+  inner.close
+  a.close
   expect-equals [] f.take-log

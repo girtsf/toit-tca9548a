@@ -23,15 +23,24 @@ Driver for the TCA9548A 8-channel I2C multiplexer.
 
 Opens chips behind the multiplexer with $device, and controls the channels
   manually with $select and $enabled-mask.
+
+A multiplexer behind a channel of another one is opened with $nested.
 */
 class Driver:
+  // The multiplexer chip. Like an i2c.Device; untyped so tests can pass a fake.
   mux_ := ?
-  open_/Lambda
+  // Opens upstream devices. Null for nested drivers, which use the root's.
+  open_/Lambda?
+  // The multiplexer this one is behind, and the channel and address there.
+  parent_/Driver?
+  parent-channel_/int
+  address_/int
   reset-pin_/gpio.Pin?
-  mutex_/monitor.Mutex ::= monitor.Mutex
+  // Shared by all drivers of a tree of nested multiplexers.
+  mutex_/monitor.Mutex
   // Cached control register. Null if unknown.
   mask_/int? := null
-  // Map from address to the shared upstream device.
+  // Map from address to the shared upstream device. Only used by the root.
   shared_/Map ::= {:}
   // Set of (channel, address) keys of open channel devices.
   open-keys_/Set ::= {}
@@ -48,21 +57,29 @@ class Driver:
   The driver does not take ownership of the $bus or the $reset pin.
   */
   constructor bus/i2c.Bus --address/int=I2C-ADDRESS --reset/gpio.Pin?=null:
-    if not I2C-ADDRESS <= address <= I2C-ADDRESS-MAX: throw "INVALID_ARGUMENT"
+    check-address_ address
     mux := bus.device address
     return Driver.from-devices_ mux --reset=reset --open=:: bus.device it
 
-  /**
-  Constructs a driver from the multiplexer device $mux_.
-
-  The $open lambda is called with an I2C address and must return a device
-    with the same interface as $i2c.Device.
-
-  Takes ownership of $mux_.
-  */
   constructor.from-devices_ .mux_ --open/Lambda --reset/gpio.Pin?=null:
     open_ = open
+    parent_ = null
+    parent-channel_ = 0
+    address_ = 0
+    mutex_ = monitor.Mutex
     reset-pin_ = reset
+    if reset:
+      reset.configure --output
+      reset.set 1
+
+  constructor.nested_ parent/Driver --channel/int address/int --reset/gpio.Pin?:
+    open_ = null
+    parent_ = parent
+    parent-channel_ = channel
+    address_ = address
+    mutex_ = parent.mutex_
+    reset-pin_ = reset
+    mux_ = parent.mutex_.do: parent.open-device_ channel address
     if reset:
       reset.configure --output
       reset.set 1
@@ -93,6 +110,8 @@ class Driver:
   enabled-mask -> int:
     return mutex_.do:
       check-open_
+      // Not the parent's with-channel: the tree's lock is already held.
+      select-upstream_
       mask_ = null
       mask := (mux_.read 1)[0]
       mask_ = mask
@@ -118,6 +137,30 @@ class Driver:
       mask_ = 0
 
   /**
+  Opens the multiplexer at the given I2C $address behind the given $channel.
+
+  Every transaction of the returned driver, and of the devices opened with its
+    $device, first selects the $channel on this multiplexer. All drivers of a
+    tree share one lock, so transactions of different tasks are serialized.
+
+  The nested multiplexer keeps its channels enabled while this one talks to
+    other devices on the same $channel. Such devices see the chips behind the
+    enabled nested channels, so their addresses must not clash; call
+    $disable-all on the nested driver before using them.
+
+  The $reset pin is handled as for the main constructor.
+
+  Closing this driver closes the nested one too.
+
+  Throws if a device with the same $address on the same $channel is
+    already open.
+  */
+  nested --channel/int address/int --reset/gpio.Pin?=null -> Driver:
+    check-channel_ channel
+    check-address_ address
+    return Driver.nested_ this --channel=channel address --reset=reset
+
+  /**
   Opens the device at the given I2C $address on the given $channel.
 
   Throws if a device with the same $address on the same $channel is
@@ -126,16 +169,7 @@ class Driver:
   device --channel/int address/int -> ChannelDevice:
     check-channel_ channel
     return mutex_.do:
-      check-open_
-      key := (channel << 16) | address
-      if open-keys_.contains key: throw "Device already connected"
-      shared/SharedDevice_? := shared_.get address
-      if not shared:
-        shared = SharedDevice_ (open_.call address)
-        shared_[address] = shared
-      shared.count++
-      open-keys_.add key
-      ChannelDevice.init_ this channel address shared.device
+      ChannelDevice.init_ this channel address (open-device_ channel address)
 
   /**
   Disables all channels and releases the multiplexer and all devices
@@ -146,56 +180,120 @@ class Driver:
   close -> none:
     mutex_.do:
       if is-closed_: continue.do
+      if parent_ and not parent_.is-open_:
+        // The root already released all devices.
+        is-closed_ = true
+        continue.do
       is-closed_ = true
       try:
+        select-upstream_
         mux_.write #[0]
         mask_ = 0
       finally:
-        // Device closes wait for the bus, which throws when cancelled or
-        // past a deadline, and would leak the devices not closed yet.
-        critical-do --no-respect-deadline:
-          shared_.do --values: it.device.close
+        if parent_:
+          open-keys_.do: | key/int | release-upstream_ (key & 0xffff)
+          open-keys_.clear
+          parent_.close-device_ parent-channel_ address_
+        else:
+          shared_.do --values: | shared/SharedDevice_ | shared.device.close
           shared_.clear
           open-keys_.clear
           mux_.close
 
   /**
-  Runs the $block with only the $channel enabled.
+  Runs the $block with only the $channel enabled, and returns its result.
 
-  Holds the lock while running the $block.
+  For a nested driver (see $nested), the path through the parents is
+    selected too.
+
+  Holds the lock of the whole tree of multiplexers while running the $block,
+    so other tasks can't switch channels in between. Use it for chips whose
+    driver doesn't take a $serial.Device, or for transactions that must not be
+    interleaved. The $block must not use this driver, the devices opened with
+    $device, or any other driver of the tree; the lock isn't reentrant.
+
+  The $channel must be in range 0 to $CHANNEL-COUNT (exclusive).
   */
-  with-channel_ channel/int [block]:
+  with-channel channel/int [block]:
+    check-channel_ channel
     return mutex_.do:
-      check-open_
       set-mask_ (1 << channel)
       block.call
 
   release_ channel/int address/int -> none:
     mutex_.do:
-      if is-closed_: continue.do
-      key := (channel << 16) | address
-      if not open-keys_.contains key: continue.do
-      open-keys_.remove key
-      shared/SharedDevice_ := shared_[address]
-      shared.count--
-      if shared.count == 0:
-        shared_.remove address
-        shared.device.close
+      if is-open_: close-device_ channel address
+
+  /**
+  Opens the upstream device for the $address on the $channel.
+
+  Caller must hold $mutex_.
+  */
+  open-device_ channel/int address/int:
+    check-open_
+    key := (channel << 16) | address
+    if open-keys_.contains key: throw "Device already connected"
+    device := acquire-upstream_ address
+    open-keys_.add key
+    return device
+
+  /** Caller must hold $mutex_. */
+  close-device_ channel/int address/int -> none:
+    key := (channel << 16) | address
+    if not open-keys_.contains key: return
+    open-keys_.remove key
+    release-upstream_ address
+
+  /** Caller must hold $mutex_. */
+  acquire-upstream_ address/int:
+    if parent_: return parent_.acquire-upstream_ address
+    shared/SharedDevice_? := shared_.get address
+    if not shared:
+      shared = SharedDevice_ (open_.call address)
+      shared_[address] = shared
+    shared.count++
+    return shared.device
+
+  /** Caller must hold $mutex_. */
+  release-upstream_ address/int -> none:
+    if parent_:
+      parent_.release-upstream_ address
+      return
+    shared/SharedDevice_ := shared_[address]
+    shared.count--
+    if shared.count == 0:
+      shared_.remove address
+      shared.device.close
+
+  /**
+  Selects the channel this multiplexer is behind, on all its ancestors.
+
+  Caller must hold $mutex_.
+  */
+  select-upstream_ -> none:
+    if parent_: parent_.set-mask_ (1 << parent-channel_)
 
   /** Caller must hold $mutex_. */
   set-mask_ mask/int -> none:
     check-open_
+    select-upstream_
     if mask_ == mask: return
     // If the write fails, the state of the register is unknown.
     mask_ = null
     mux_.write #[mask]
     mask_ = mask
 
+  is-open_ -> bool:
+    return not is-closed_ and (not parent_ or parent_.is-open_)
+
   check-open_ -> none:
-    if is-closed_: throw "CLOSED"
+    if not is-open_: throw "CLOSED"
 
   static check-channel_ channel/int -> none:
     if not 0 <= channel < CHANNEL-COUNT: throw "INVALID_ARGUMENT"
+
+  static check-address_ address/int -> none:
+    if not I2C-ADDRESS <= address <= I2C-ADDRESS-MAX: throw "INVALID_ARGUMENT"
 
 class SharedDevice_:
   device ::= ?
@@ -288,7 +386,7 @@ class ChannelDevice implements serial.Device:
   with-channel_ [block]:
     driver := driver_
     if not driver: throw "CLOSED"
-    return driver.with-channel_ channel block
+    return driver.with-channel channel block
 
 class ChannelRegisters_ extends serial.Registers:
   device_/ChannelDevice
